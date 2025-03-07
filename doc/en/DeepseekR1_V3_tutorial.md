@@ -16,7 +16,7 @@
 			- [Memory consumptions:](#memory-consumptions)
 			- [Benchmark results](#benchmark-results-2)
 	- [How to Run](#how-to-run)
-		- [V0.2.2 longer context \& FP8 kernel](#v022-longer-context--fp8-kernel)
+		- [v0.2.2 \& v0.2.3 longer context \& FP8 kernel](#v022--v023-longer-context--fp8-kernel)
 			- [longer context](#longer-context)
 			- [FP8 kernel](#fp8-kernel)
 		- [V0.2 \& V0.2.1 Showcase](#v02--v021-showcase)
@@ -86,7 +86,7 @@ Memory: standard DDR5-4800 server DRAM (1 TB), each socket with 8×DDR5-4800
 #### Change Log
 - Longer Context (from 4K to 8K for 24GB VRAM) and Slightly Faster Speed （+15%):<br>
 Integrated the highly efficient Triton MLA Kernel from the fantastic sglang project, enable much longer context length and slightly faster prefill/decode speed
-- We suspect that some of the improvements come from the change of hardwre platform (4090D->4090)
+- We suspect that some of the improvements come from the change of hardware platform (4090D->4090)
 #### Benchmark Results
 
 
@@ -157,9 +157,10 @@ the output quality doesn't change. But the speed of decoding and prefill
 is speed up which is inspiring. So our showcase makes use of this finding*
 
 ## How to Run
-### V0.2.2 longer context & FP8 kernel
+### v0.2.2 & v0.2.3 longer context & FP8 kernel
 #### longer context
 To use this feature, [install flashinfer](https://github.com/flashinfer-ai/flashinfer) first.
+
 Note: The latest MLA kernel in FlashInfer still has a few minor issues. They are continuously fixing them on the main branch. If you are using FlashInfer, please install it from the main source code.
 
 If you want to use long context(longer than 20K) for prefill, enable the matrix absorption MLA during the prefill phase, which will significantly reduce the size of the kv cache. Modify yaml file like this:
@@ -173,6 +174,8 @@ If you want to use long context(longer than 20K) for prefill, enable the matrix 
       prefill_device: "cuda"
       absorb_for_prefill: True # change this to True to enable long context(prefill may slower).
 ```
+
+If the VRAM is still insufficient, try reducing the `chunk_prefill_size` parameter (default is 8192) to further decrease the intermediate results during chunk prefill.
 #### FP8 kernel
 
 The DeepSeek-AI team provides FP8 safetensors for DeepSeek-R1/V3 models. We achieve performance optimization through the following works:
