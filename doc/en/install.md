@@ -1,5 +1,11 @@
-
+<!-- omit in toc -->
 # How to Run DeepSeek-R1
+- [Preparation](#preparation)
+- [Installation](#installation)
+  - [Attention](#attention)
+  - [Supported models include:](#supported-models-include)
+  - [Support quantize format:](#support-quantize-format)
+
 In this document, we will show you how to install and run KTransformers on your local machine. There are two versions: 
 * V0.2 is the current main branch.
 * V0.3 is a preview version only provides binary distribution for now.
@@ -43,7 +49,7 @@ Some preparation:
   
   conda install -c conda-forge libstdcxx-ng # Anaconda provides a package called `libstdcxx-ng` that includes a newer version of `libstdc++`, which can be installed via `conda-forge`.
 
-  strings ~/anaconda3/envs/ktransformers-0.3/lib/libstdc++.so.6 | grep GLIBCXX
+  strings ~/anaconda3/envs/ktransformers/lib/libstdc++.so.6 | grep GLIBCXX
   ```
 
 - Make sure that PyTorch, packaging, ninja is installed You can also [install previous versions of PyTorch](https://pytorch.org/get-started/previous-versions/)
@@ -56,6 +62,8 @@ Some preparation:
  - At the same time, you should download and install the corresponding version of flash-attention from https://github.com/Dao-AILab/flash-attention/releases.
 
 ## Installation
+### Attention
+If you want to use numa support, not only do you need to set USE_NUMA=1, but you also need to make sure you have installed the libnuma-dev (`sudo apt-get install libnuma-dev` may help you).
 
 <!-- 1. ~~Use a Docker image, see [documentation for Docker](./doc/en/Docker.md)~~
    
@@ -91,10 +99,11 @@ Some preparation:
         ```
      - For those who have two cpu and 1T RAM:
 
-        ```shell
+       ```shell
         # Make sure your system has dual sockets and double size RAM than the model's size (e.g. 1T RAM for 512G model)
+        apt install libnuma-dev
         export USE_NUMA=1
-        bash install.sh # or `make dev_install`
+        bash install.sh # or #make dev_install
         ```
 
    - For Windows
