@@ -25,6 +25,7 @@ import kt_kernel_ext.moe as _moe_mod
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
 AMXInt4_KGroup_MOE = getattr(_moe_mod, "AMXInt4_KGroup_MOE", None)
+AMXInt4_KGroupBlocked_MOE = getattr(_moe_mod, "AMXInt4_KGroupBlocked_MOE", None)
 AMXFP4_KGroup_MOE = getattr(_moe_mod, "AMXFP4_KGroup_MOE", None)
 AMXMXFP8_KGroup_MOE = getattr(_moe_mod, "AMXMXFP8_KGroup_MOE", None)
 AMXFP8_MOE = getattr(_moe_mod, "AMXFP8_MOE", None)
@@ -43,6 +44,7 @@ SYCLGPTQInt4_MOE = getattr(_moe_mod, "SYCLGPTQInt4_MOE", None)
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
 _HAS_AMXINT8_SUPPORT = AMXInt8_MOE is not None
 _HAS_RAWINT4_SUPPORT = AMXInt4_KGroup_MOE is not None
+_HAS_RAWINT4_BLOCKED_SUPPORT = AMXInt4_KGroupBlocked_MOE is not None
 _HAS_MXFP4_SUPPORT = AMXFP4_KGroup_MOE is not None
 _HAS_MXFP8_SUPPORT = AMXMXFP8_KGroup_MOE is not None
 _HAS_FP8_SUPPORT = AMXFP8_MOE is not None
@@ -139,6 +141,13 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
         if not _HAS_RAWINT4_SUPPORT:
             raise RuntimeError("KT_RAWINT4_BACKEND=amx requested, but AMXInt4_KGroup_MOE is not compiled in.")
         return AMXInt4_KGroup_MOE
+
+    if forced in {"amx_blocked", "blocked"}:
+        if not _HAS_RAWINT4_BLOCKED_SUPPORT:
+            raise RuntimeError(
+                "KT_RAWINT4_BACKEND=amx_blocked requested, but AMXInt4_KGroupBlocked_MOE is not compiled in."
+            )
+        return AMXInt4_KGroupBlocked_MOE
 
     if forced in {"avxvnni", "avxvnni256"}:
         if not _HAS_AVXVNNI256_RAW_INT4_SUPPORT:
