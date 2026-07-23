@@ -23,6 +23,9 @@ from .arch import (
 )
 from .layer import KTMoELayerWrapper
 from .lora import LoRAExperts
+from .base import _supports_authoritative_optimizer_grads
+from .checkpoint import load_full_weight_layer, resolve_full_weight_checkpoint
+from .dist_utils import _distributed_rank_world_size
 from .weights import (
     _clear_original_expert_weights,
     extract_moe_weights,
@@ -41,6 +44,10 @@ if KT_KERNEL_AVAILABLE:
         KT_KERNEL_AVAILABLE = False
 else:
     KTMoEWrapper = None
+
+
+def _supports_checkpoint_forward_reuse(full_weight_grad: bool, lora_rank: int) -> bool:
+    return (full_weight_grad and lora_rank == 0) or (not full_weight_grad and lora_rank > 0)
 
 
 # =============================================================================
@@ -95,9 +102,7 @@ def build_kt_device_map(config, kt_plugin, device: str = "cuda:0") -> dict[str, 
             else:
                 device_map[expert_key] = "cpu"
 
-    logger.info(
-        f"Built KT device_map: {num_gpu_experts} GPU experts, {num_experts - num_gpu_experts} CPU experts"
-    )
+    logger.info(f"Built KT device_map: {num_gpu_experts} GPU experts, {num_experts - num_gpu_experts} CPU experts")
 
     return device_map
 
@@ -146,15 +151,13 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     LoRA is handled by PEFT and later adapted via kt_adapt_peft_lora().
     Only rank 0 initializes KT kernel and loads weights.
     """
-    import torch.distributed as dist
-
     if not KT_KERNEL_AVAILABLE:
         raise KTAMXNotAvailableError("kt_kernel not found. Please install kt_kernel to enable KT MoE support.")
 
-    # Only rank 0 should initialize KT and load weights
-    is_rank_0 = True
-    if dist.is_initialized():
-        is_rank_0 = dist.get_rank() == 0
+    # Only global rank 0 initializes KT. Launcher env fallback matters when
+    # model construction happens before init_process_group().
+    distributed_rank, distributed_world_size = _distributed_rank_world_size()
+    is_rank_0 = distributed_rank == 0
 
     moe_config = get_moe_arch_config(model.config)
     _text_cfg = getattr(model.config, "text_config", model.config)
@@ -163,8 +166,27 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     cfg = _get_kt_config(kt_plugin)
 
     # Read lora_rank/lora_alpha for C++ wrapper initialization (buffer allocation only)
-    lora_rank = getattr(cfg, "kt_lora_rank", 1) or 1
-    lora_alpha = getattr(cfg, "kt_lora_alpha", 1.0) or 1.0
+    # Use explicit None checks: lora_rank=0 is a valid value (full mode, no LoRA),
+    # but `or` pattern would treat 0 as falsy and replace it with 1.
+    _raw_rank = getattr(cfg, "kt_lora_rank", None)
+    lora_rank = _raw_rank if _raw_rank is not None else 1
+    _raw_alpha = getattr(cfg, "kt_lora_alpha", None)
+    lora_alpha = _raw_alpha if _raw_alpha is not None else 1.0
+
+    # Read full_weight_grad mode
+    _raw_fwg = getattr(cfg, "kt_full_weight_grad", None)
+    full_weight_grad = _raw_fwg if _raw_fwg is not None else False
+    train_mode = getattr(cfg, "kt_train_mode", "lora")
+
+    # Full and hybrid are explicit modes.  LlamaFactory exposes a default
+    # lora_rank even for full tuning, which must not silently turn Full into
+    # Hybrid.  Preserve the legacy fallback for callers without train_mode.
+    if train_mode == "full":
+        lora_rank = 0
+    elif full_weight_grad and train_mode != "hybrid" and lora_rank > 0:
+        _has_explicit_lora_rank = getattr(cfg, "kt_lora_rank", None) is not None
+        if not _has_explicit_lora_rank:
+            lora_rank = 0
 
     # Read LoRA Experts configuration
     _raw_le = getattr(cfg, "kt_use_lora_experts", None)
@@ -177,6 +199,8 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             f"LoRA Experts config: use_lora_experts={use_lora_experts}, "
             f"num={lora_expert_num}, intermediate_size={lora_expert_intermediate_size}"
         )
+        if full_weight_grad:
+            logger.info(f"Full weight gradient mode enabled (lora_rank={lora_rank})")
 
     wrappers: list[KTMoELayerWrapper] = []
     moe_layer_count = 0
@@ -201,6 +225,10 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
 
     if "SkipLoRA" in kt_method:
         logger.info(f"Using SkipLoRA backend: {kt_method} (MoE LoRA gradients will be skipped)")
+    requested_num_gpu_experts = int(getattr(cfg, "kt_num_gpu_experts", 0) or 0)
+    uses_authoritative_optimizer_grads = _supports_authoritative_optimizer_grads(
+        kt_method, requested_num_gpu_experts
+    )
 
     threadpool_count = getattr(cfg, "kt_threadpool_count", 1) if getattr(cfg, "kt_tp_enabled", False) else 1
 
@@ -215,7 +243,16 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     # When kt_expert_checkpoint_path is set, always resolve from it (overrides any existing
     # checkpoint_files which may come from AttnOnlyBf16 and lack expert weights).
     kt_expert_checkpoint_path = getattr(cfg, "kt_expert_checkpoint_path", None)
-    if kt_expert_checkpoint_path:
+    full_weight_checkpoint = resolve_full_weight_checkpoint(kt_expert_checkpoint_path)
+    use_full_weight_checkpoint = full_weight_checkpoint is not None
+    if use_full_weight_checkpoint and use_kt_weight_path:
+        raise KTAMXConfigError(
+            "A KT Full checkpoint and kt_weight_path were both selected. "
+            "Choose exactly one authoritative expert weight source."
+        )
+    if use_full_weight_checkpoint:
+        logger.info(f"Loading expert weights from KT Full checkpoint: {full_weight_checkpoint}")
+    elif kt_expert_checkpoint_path:
         logger.info(f"Resolving expert checkpoint files from kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}")
         resolved_files, resolved_meta = _resolve_checkpoint_files(model_name_or_path=kt_expert_checkpoint_path)
         if resolved_files and all(f.endswith(".safetensors") for f in resolved_files):
@@ -225,22 +262,32 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             cfg.kt_sharded_metadata = sharded_metadata
             logger.info(f"Resolved {len(checkpoint_files)} checkpoint files from kt_expert_checkpoint_path")
         else:
-            logger.warning(f"Failed to resolve checkpoint files from kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}")
+            logger.warning(
+                f"Failed to resolve checkpoint files from kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}"
+            )
 
-    use_checkpoint_files = bool(checkpoint_files) and not use_kt_weight_path
+    use_checkpoint_files = bool(checkpoint_files) and not use_kt_weight_path and not use_full_weight_checkpoint
 
     logger.debug(
         f"Weight source: kt_weight_path={kt_weight_path!r}, "
         f"kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}, "
+        f"full_weight_checkpoint={full_weight_checkpoint!r}, "
         f"checkpoint_files count={len(checkpoint_files) if checkpoint_files else 0}, "
-        f"use_kt_weight_path={use_kt_weight_path}, use_checkpoint_files={use_checkpoint_files}"
+        f"use_kt_weight_path={use_kt_weight_path}, use_full_weight_checkpoint={use_full_weight_checkpoint}, "
+        f"use_checkpoint_files={use_checkpoint_files}"
     )
 
-    if use_checkpoint_files:
+    if use_full_weight_checkpoint:
+        logger.info("Loading expert weights from a KT Full checkpoint.")
+    elif use_checkpoint_files:
         logger.info("Loading expert weights from checkpoint files (online conversion).")
     elif use_kt_weight_path and bool(checkpoint_files):
         logger.info("BF16 checkpoint files available for backward gradient computation.")
-    elif (not use_kt_weight_path) and bool(getattr(cfg, "kt_skip_expert_loading", False)):
+    elif (
+        not use_kt_weight_path
+        and not use_full_weight_checkpoint
+        and bool(getattr(cfg, "kt_skip_expert_loading", False))
+    ):
         # If HF expert weights were skipped during `from_pretrained`, we must source expert weights externally.
         model_name_or_path = getattr(getattr(model, "config", None), "name_or_path", None)
         if model_name_or_path:
@@ -258,9 +305,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 "KT skip_expert_loading is enabled but no `kt_weight_path` was provided and no safetensors checkpoint "
                 "files could be resolved for on-the-fly expert loading."
             )
-
-    import torch.distributed as _dist
-    _rank = _dist.get_rank() if _dist.is_initialized() else 0
 
     model_container, layers = _get_model_container_and_layers(model, purpose="wrapping")
     logger.info(f"Total layers={len(layers)}, is_rank_0={is_rank_0}")
@@ -288,7 +332,30 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             if _quant_cfg is not None:
                 _block_size = getattr(_quant_cfg, "weight_block_size", None)
 
-            if use_kt_weight_path:
+            if use_full_weight_checkpoint:
+                expected_shapes = {
+                    "gate_proj": (
+                        int(moe_config.expert_num),
+                        int(moe_config.intermediate_size),
+                        int(hidden_size),
+                    ),
+                    "up_proj": (
+                        int(moe_config.expert_num),
+                        int(moe_config.intermediate_size),
+                        int(hidden_size),
+                    ),
+                    "down_proj": (
+                        int(moe_config.expert_num),
+                        int(hidden_size),
+                        int(moe_config.intermediate_size),
+                    ),
+                }
+                gate_proj, up_proj, down_proj = load_full_weight_layer(
+                    full_weight_checkpoint,
+                    layer_idx=layer_idx,
+                    expected_shapes=expected_shapes,
+                )
+            elif use_kt_weight_path:
                 logger.debug(f"Layer {layer_idx}: forward + backward from kt_weight_path (.kt files)")
             elif use_checkpoint_files:
                 layers_prefix = _get_layers_prefix(model.config)
@@ -309,6 +376,10 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
         chunked_prefill_size = getattr(cfg, "kt_model_max_length", None)
         if chunked_prefill_size is None:
             chunked_prefill_size = getattr(model.config, "max_position_embeddings", 4096)
+        # Rank 0 receives the concatenation of every rank's local rows.  Model
+        # configs are homogeneous across ranks, so the sum of local maxima is
+        # the per-rank capacity multiplied by world size.
+        rank0_chunked_prefill_size = int(chunked_prefill_size) * distributed_world_size
 
         # Only rank 0 creates KTMoEWrapper and loads weights
         if is_rank_0:
@@ -323,17 +394,33 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 cpuinfer_threads=getattr(cfg, "kt_num_threads", 1),
                 threadpool_count=threadpool_count,
                 weight_path=kt_weight_path or "",
-                chunked_prefill_size=chunked_prefill_size,
+                chunked_prefill_size=rank0_chunked_prefill_size,
                 method=kt_method,
                 mode="sft",
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 max_cache_depth=getattr(cfg, "kt_max_cache_depth", 2),
+                full_weight_grad=full_weight_grad,
             )
+            # The current SFT wrapping path routes all experts through KT even
+            # when the loading config requested GPU experts. Preserve that
+            # configuration's legacy gradient lifecycle until the hybrid
+            # routed-expert path supports authoritative buffers end to end.
+            wrapper._uses_authoritative_optimizer_grads = uses_authoritative_optimizer_grads
 
             # Set share_backward_bb and share_cache_pool BEFORE load_weights (config is built during load)
             wrapper.share_backward_bb = cfg.kt_share_backward_bb
-            wrapper.share_cache_pool = cfg.kt_share_cache_pool
+            single_process = distributed_world_size == 1
+            reuse_checkpoint_forward = (
+                single_process
+                and _supports_checkpoint_forward_reuse(full_weight_grad, lora_rank)
+                and kt_method == "AMXBF16_SFT"
+                and os.environ.get("KT_REUSE_CHECKPOINT_FORWARD", "1") != "0"
+            )
+            wrapper.reuse_checkpoint_forward = reuse_checkpoint_forward
+            # Reusing the first checkpoint forward requires each layer's C++
+            # activations to remain valid until its backward invocation.
+            wrapper.share_cache_pool = False if reuse_checkpoint_forward else cfg.kt_share_cache_pool
 
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
@@ -352,9 +439,18 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                     physical_to_logical_map_cpu=physical_to_logical_map,
                 )
 
-            wrapper.gate_proj = None
-            wrapper.up_proj = None
-            wrapper.down_proj = None
+            # In full_weight_grad mode, keep weight references for nn.Parameter initialization
+            # and initialize the base weight buffers
+            if full_weight_grad:
+                wrapper.init_full_weight_grad_buffers(
+                    gate_proj=wrapper.gate_proj if wrapper.gate_proj is not None else gate_proj,
+                    up_proj=wrapper.up_proj if wrapper.up_proj is not None else up_proj,
+                    down_proj=wrapper.down_proj if wrapper.down_proj is not None else down_proj,
+                )
+            else:
+                wrapper.gate_proj = None
+                wrapper.up_proj = None
+                wrapper.down_proj = None
 
         # Create LoRA Experts if enabled
         lora_experts = None
@@ -375,22 +471,28 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             hidden_size=hidden_size,
             layer_idx=layer_idx,
             lora_experts=lora_experts,
+            full_weight_grad=full_weight_grad,
+            uses_authoritative_optimizer_grads=uses_authoritative_optimizer_grads,
         )
         layer_wrapper._fused_experts = _layer_is_fused
         layer_wrapper._lora_rank = lora_rank
+        layer_wrapper._kt_owner_rank = 0
+        layer_wrapper._kt_world_size_at_wrap = distributed_world_size
 
         setattr(layer, moe_config.moe_layer_attr, layer_wrapper)
         # Base weights have been copied into the C++ kernel's internal BufferB format.
-        # Do not hold a Python-side reference --- it wastes ~1 GB/layer.
+        # In full_weight_grad mode, the authoritative copies are gate_proj_buf etc.
+        # Always release local references to save ~1 GB/layer.
         del gate_proj, up_proj, down_proj
 
         wrappers.append(layer_wrapper)
         moe_layer_count += 1
 
-        # Replace original expert weights with meta placeholders.
+        # Replace original expert weights with zero-storage placeholders.
         # Experts remain in the model tree (via wrapper.experts) so PEFT can discover them.
         # Rank 0 already copied weights to C++ kernel via load_weights_from_tensors.
-        _clear_original_expert_weights(moe_module, moe_config)
+        # gate_proj_buf serves as the authoritative copy in full_weight_grad mode.
+        _clear_original_expert_weights(moe_module, moe_config, full_weight_grad=full_weight_grad)
 
     logger.info(f"Wrapped {moe_layer_count} MoE layers with KTMoEWrapper")
 
@@ -420,6 +522,23 @@ def _build_kt_plugin_from_args(model_args: Any, finetuning_args: Any | None = No
     from .config import KTConfig
     from accelerate.utils.dataclasses import KTransformersPlugin
 
+    # Map LlamaFactory finetuning_type to kt_train_mode
+    finetuning_type = getattr(finetuning_args, "finetuning_type", None) if finetuning_args else None
+    kt_train_mode_map = {
+        "full": "full",
+        "freeze": "hybrid",
+        "lora": "lora",
+        "galore": "full",
+        "badam": "full",
+    }
+    kt_train_mode = kt_train_mode_map.get(finetuning_type, None) if finetuning_type else None
+
+    configured_lora_rank = getattr(finetuning_args, "lora_rank", None) if finetuning_args else None
+    configured_lora_alpha = getattr(finetuning_args, "lora_alpha", None) if finetuning_args else None
+    if kt_train_mode == "full":
+        configured_lora_rank = None
+        configured_lora_alpha = None
+
     kt_config = KTConfig(
         kt_backend=getattr(model_args, "kt_backend", None),
         kt_num_threads=getattr(model_args, "kt_num_threads", None),
@@ -432,9 +551,10 @@ def _build_kt_plugin_from_args(model_args: Any, finetuning_args: Any | None = No
         kt_use_lora_experts=getattr(model_args, "kt_use_lora_experts", None),
         kt_lora_expert_num=getattr(model_args, "kt_lora_expert_num", None),
         kt_lora_expert_intermediate_size=getattr(model_args, "kt_lora_expert_intermediate_size", None),
-        kt_lora_rank=getattr(finetuning_args, "lora_rank", None) if finetuning_args else None,
-        kt_lora_alpha=getattr(finetuning_args, "lora_alpha", None) if finetuning_args else None,
+        kt_lora_rank=configured_lora_rank,
+        kt_lora_alpha=configured_lora_alpha,
         kt_model_max_length=getattr(model_args, "model_max_length", None),
+        kt_train_mode=kt_train_mode,
     )
     return KTransformersPlugin(enabled=True, kt_config=kt_config)
 
@@ -509,7 +629,13 @@ def load_kt_model(
     **kwargs,
 ) -> nn.Module:
     """Load model with KTMoEWrapper backend."""
-    from .arch import get_moe_arch_config, move_non_experts_to_gpu, get_expert_device, KTAMXNotAvailableError, KTAMXConfigError
+    from .arch import (
+        get_moe_arch_config,
+        move_non_experts_to_gpu,
+        get_expert_device,
+        KTAMXNotAvailableError,
+        KTAMXConfigError,
+    )
 
     if kt_plugin is None:
         if model_args is None:
@@ -536,8 +662,11 @@ def load_kt_model(
     from transformers.integrations.kt import set_kt_config, unset_kt_config
 
     loading_kwargs = get_kt_loading_kwargs(
-        config, kt_plugin, torch_dtype=torch_dtype,
-        trust_remote_code=trust_remote_code, token=token,
+        config,
+        kt_plugin,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        token=token,
     )
     if model_args is not None:
         for key in ("cache_dir", "revision"):
@@ -547,12 +676,25 @@ def load_kt_model(
     loading_kwargs.update(kwargs)
 
     cfg = _get_kt_config(kt_plugin)
+    auto_full_weight_checkpoint = resolve_full_weight_checkpoint(model_name_or_path)
+    if auto_full_weight_checkpoint is not None and getattr(cfg, "kt_expert_checkpoint_path", None) is None:
+        cfg.kt_expert_checkpoint_path = auto_full_weight_checkpoint
+        plugin_config = getattr(kt_plugin, "kt_config", None)
+        if isinstance(plugin_config, dict):
+            plugin_config["kt_expert_checkpoint_path"] = auto_full_weight_checkpoint
+        elif plugin_config is not None:
+            setattr(plugin_config, "kt_expert_checkpoint_path", auto_full_weight_checkpoint)
+        else:
+            setattr(kt_plugin, "kt_expert_checkpoint_path", auto_full_weight_checkpoint)
+        logger.info("Detected KT Full checkpoint in model directory: %s", auto_full_weight_checkpoint)
 
     if getattr(cfg, "kt_skip_expert_loading", None) is None:
         checkpoint_files, sharded_metadata = _resolve_checkpoint_files(
             model_name_or_path=model_name_or_path,
-            cache_dir=cache_dir, revision=revision,
-            token=token, trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
+            revision=revision,
+            token=token,
+            trust_remote_code=trust_remote_code,
         )
         if checkpoint_files and all(f.endswith(".safetensors") for f in checkpoint_files):
             if getattr(cfg, "kt_weight_path", None) is None:
@@ -583,6 +725,8 @@ def load_kt_model(
     model._kt_wrappers = wrappers
     model._kt_tp_enabled = bool(getattr(cfg, "kt_tp_enabled", False))
     model._kt_use_lora_experts = bool(getattr(cfg, "kt_use_lora_experts", False))
+    model._kt_full_weight_grad = bool(getattr(cfg, "kt_full_weight_grad", False))
+    model._kt_train_mode = getattr(cfg, "kt_train_mode", "lora")
 
     logger.info("Model loaded with KTMoEWrapper backend successfully")
     return model
